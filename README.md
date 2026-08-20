@@ -26,6 +26,14 @@ A persistent cross-session Neural Knowledge Graph (NKG) that captures decisions,
 | `tokdsh-2` | Dynamic Cordis Plugin | Live token counter in the composer dock |
 | `cordis-lite` | Agent Preset | Lean coding agent preset with compact persona, no runtime context, no ralph |
 
+## NKG v2 Features
+
+- **TF-IDF semantic retrieval** — cosine similarity search across all nodes (zero dependencies, pure JS)
+- **Jaccard deduplication** — merges similar errors/decisions (token overlap > 70%), increments `count`
+- **Edge weighting** — repeated file-error or file-decision connections strengthen edges
+- **Fix hints** — pattern-matches common errors (EPERM, sandbox, not found) and suggests fixes
+- **Frequency-weighted injection** — top errors/decisions by recurrence + semantic neighbors of most recent error
+
 ## NKG Graph Schema
 
 ```json
