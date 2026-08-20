@@ -1,4 +1,4 @@
-# Harness NKG Framework
+# Deep Seek Harness NKG Framework
 
 A persistent, self-evolving Neural Knowledge Graph for the DeepSeek Harness — capturing every decision, error, and file relationship across sessions into a self-optimizing graph. Injects compressed context (at most 5 lines) instead of verbose prompts.
 
