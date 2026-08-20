@@ -240,3 +240,11 @@
   config:
     fetch: false
     searchTimeoutMs: 60000
+
+# ── neural knowledge graph ────────────────────────────────────────────────
+
+# Consumer row: NKG injects fs and systemPrompt, listens to tools/result.
+# Publishes no services, so no isolate realm needed.
+# Lives in the preset so it mounts with every session.
+- id: nkg
+  name: ./plugins/nkg/index.js
