@@ -1,41 +1,122 @@
-# Deep Seek Harness NKG Framework
+# 🧠 NKG — Neural Knowledge Graph for AI Agents
 
-A persistent, self-evolving Neural Knowledge Graph for the DeepSeek Harness — capturing every decision, error, and file relationship across sessions into a self-optimizing graph. Injects compressed context (at most 5 lines) instead of verbose prompts.
+**Give your AI agent a memory that survives restarts, learns from mistakes, and costs almost nothing in tokens.**
 
-## What makes it a product
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Platform: DeepSeek Harness](https://img.shields.io/badge/Platform-DeepSeek%20Harness-blue.svg)](#requirements)
+[![Dependencies: 0](https://img.shields.io/badge/Dependencies-0-brightgreen.svg)](#how-it-works)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-orange.svg)](#contributing)
 
-| Feature | Description |
-|---------|-------------|
-| **Cross-session memory** | Persists `.nkg.json` per workspace — graph survives process restarts and session boundaries |
-| **Self-evolving** | Edge weights strengthen on repeated patterns; unused connections decay naturally |
-| **Semantic retrieval** | TF-IDF cosine similarity finds related nodes for any query |
-| **Deduplication** | Same error happening again increments count instead of creating duplicates |
-| **Compressed context** | Injects at most 5 lines before each model step — not paragraphs |
-| **Live extraction** | Captures every shell error and file edit as graph nodes in real time |
-| **Static plugin** | Mounts automatically with the `cordis-lite` preset — no manual `cordis_define`/`cordis_run` |
+---
 
-## Architecture
+## The problem
+
+Every AI coding agent has amnesia. It hits the same sandbox error it hit yesterday, rediscovers the same fix, re-reads the same files — and you pay for that rediscovery in tokens, latency, and wrong turns. Session ends, everything learned is gone.
+
+## The solution
+
+NKG is a **single-file, zero-dependency Cordis plugin** for the [DeepSeek Harness](https://github.com/deepseek-ai) that builds a persistent knowledge graph from what your agent actually does:
+
+- ❌ **Errors** it hits (with known fixes, linked when a fix works)
+- 🔄 **Decisions** it makes (file edits, creations)
+- 📁 **Files** those events touch
+
+…then injects a **compressed snapshot (≤5 lines)** into the system prompt of future sessions. Not paragraphs of "memory" — a ranked, deduplicated digest of what actually matters in *this* repo.
 
 ```
-workspace/
-└── .nkg.json          ← Persistent graph (auto-created)
-
-~/.dsh/.agent-presets/cordis-lite/
-├── agent.cordis.yml    ← Preset composition (includes NKG row)
-├── preset.yml          ← Display metadata
-└── plugins/
-    └── nkg/
-        └── index.js    ← NKG Cordis plugin (load/save, extract, inject)
+## Repo Memory
+- ❌ [90%] EPERM spawning child process with stdio 'pipe' under sandbox
+  ↳ Known fix: Use stdio:inherit
+- 🔄 [75%] Edited agent.cordis.yml
+- 📁 [23%] plugins/nkg/index.js
 ```
 
-## Graph Schema
+That's the entire overhead. Five lines.
+
+## Why it's different
+
+| | Typical "agent memory" | NKG |
+|---|---|---|
+| **Storage** | Vector DB, embeddings service | One JSON file in `.git/` — follows the repo |
+| **Dependencies** | SDK + API keys + infra | Zero. ~350 lines of plain JS |
+| **Token cost** | Paragraphs of retrieved chunks | ≤5 ranked lines |
+| **Prompt caching** | Usually breaks it | **Cache-stable by design** — snapshot computed once per session so your prompt prefix never changes mid-conversation |
+| **Learning** | Static retrieval | Self-evolving: repeat errors rank higher, reused fixes strengthen edges, stale nodes decay after 30 days |
+| **Setup** | Config + accounts | Copy one folder, start a session |
+
+### Git-aware storage
+
+The graph lives in `.git/nkg.json` — inside your repo but invisible to git. Clone the repo to a new machine? Same graph location convention. Work from a subdirectory? Same graph. No git repo? Falls back to `.nkg.json` in the workspace root.
+
+### Prompt-cache-friendly (v9.1)
+
+Most context-injection plugins silently destroy request caching: content that changes every model step invalidates the cached prompt prefix, forcing full re-processing *every turn*. NKG computes its snapshot **once per session** — the prefix stays byte-stable, the cache keeps hitting, and new learnings surface in the next session. This is the difference between a memory plugin that pays for itself and one that costs more than it saves.
+
+## Quick start
+
+**Requirements:** [DeepSeek Harness](https://github.com/deepseek-ai) (`dsh`) installed.
+
+```powershell
+# Windows
+git clone https://github.com/Rikinshah787/Harness-NKG-Framework-for-AI-agent.git
+cd Harness-NKG-Framework-for-AI-agent
+./install.ps1
+```
+
+```bash
+# macOS / Linux
+git clone https://github.com/Rikinshah787/Harness-NKG-Framework-for-AI-agent.git
+cd Harness-NKG-Framework-for-AI-agent
+./install.sh
+```
+
+Then start a session on the **`cordis-lite`** preset (session picker, or set it as default in `~/.dsh/settings.yaml`):
+
+```yaml
+agent-presets:
+  default: cordis-lite
+```
+
+That's it. The graph auto-creates on the first tool event and grows as the agent works.
+
+<details>
+<summary>Manual install</summary>
+
+1. Copy `presets/cordis-lite/` → `~/.dsh/.agent-presets/cordis-lite/`
+2. Copy `plugins/nkg/` → `~/.dsh/.agent-presets/cordis-lite/plugins/nkg/`
+3. Start a session on the `cordis-lite` preset
+
+</details>
+
+## How it works
+
+```
+                        ┌─────────────────────────────┐
+  tool events           │   Knowledge Graph            │        next session
+──────────────────►     │                              │   ─────────────────►
+  shell errors          │  nodes: error / decision /   │    ≤5-line snapshot
+  file edits            │         file / fix           │    injected once,
+  successful fixes      │  edges: errored_in /         │    prompt-cache safe
+                        │         affected / fixed_by  │
+                        └──────────────┬───────────────┘
+                                       │ persists to
+                                       ▼
+                              .git/nkg.json
+```
+
+1. **Capture** — listens to `tools/result` events; shell errors, file edits, and fix confirmations become nodes and edges in real time
+2. **Evolve** — duplicate events increment counts instead of duplicating nodes; a command that succeeds right after a known error strengthens the error→fix edge; edges unused for 30 days decay and stale nodes drop out of retrieval
+3. **Retrieve** — top unresolved errors and recent decisions, plus TF-IDF cosine-similarity search for related context (no embeddings API — pure JS)
+4. **Inject** — one compressed snapshot per session via the harness `systemPrompt` service
+
+### Graph schema
 
 ```json
 {
   "nodes": {
-    "n1": { "type": "error", "tool": "pwsh", "text": "EPERM on named pipe", "fix": "Use stdio:inherit", "count": 3, "ts": "..." },
-    "n2": { "type": "decision", "text": "Created cordis-lite preset", "count": 1, "ts": "..." },
-    "n3": { "type": "file", "path": "presets/cordis-lite/agent.cordis.yml", "ts": "..." }
+    "n1": { "type": "error", "tool": "pwsh", "text": "EPERM on named pipe", "fix": "Use stdio:inherit", "count": 3 },
+    "n2": { "type": "decision", "text": "Edited agent.cordis.yml", "count": 2 },
+    "n3": { "type": "file", "path": "presets/cordis-lite/agent.cordis.yml" }
   },
   "edges": [
     { "from": "n1", "to": "n3", "label": "errored_in", "weight": 3 },
@@ -44,78 +125,38 @@ workspace/
 }
 ```
 
-## Context Output Example
-
-Before each model step, the NKG injects compressed context:
+## What's in the box
 
 ```
-## Knowledge Graph
-- ⚠️ [90%] EPERM on named pipe
-  ↳ Fix: Use stdio:inherit
-- 📋 [75%] Created cordis-lite preset
-- 📋 [50%] Built NKG with TF-IDF retrieval
+presets/cordis-lite/        Lean agent preset (standard tools, compact persona, NKG mounted)
+├── agent.cordis.yml
+└── preset.yml
+plugins/nkg/index.js        ⭐ The NKG plugin (static — mounts with the preset, survives restarts)
+plugins/nkg.js              NKG dynamic-plugin variant (try it via cordis_define without installing)
+plugins/nkg-client.js       Live graph-stats dock for the DSH web UI (dynamic)
+plugins/tokdash.js + tokdash-client.js   Bonus: live token counter under the composer
+plugins/tktrim.js           Bonus: one-liner runtime-context suppressor (~200–400 tokens/turn)
 ```
 
-## Self-Evolution
-
-- **Edge weighting:** repeated error→file associations strengthen edges
-- **Fix linking:** when a fix is reused, edges connect errors to their effective fixes
-- **Frequency scoring:** frequently encountered errors rank higher in context
-- **Semantic search:** related nodes are retrieved even without direct edge links
-
-## Static Plugin
-
-The NKG is a **permanent Cordis plugin** — not a dynamic `cordis_define`/`cordis_run` plugin that vanishes on restart.
-
-How it mounts:
-1. `agent.cordis.yml` declares: `- id: nkg\n  name: ./plugins/nkg/index.js`
-2. The Cordis loader resolves the relative path and imports the module
-3. NKG injects `fs` and `systemPrompt`, listens to `tools/result`
-4. On mount: loads `.nkg.json` from workspace root
-5. On every tool result: updates graph and persists
-6. On every model step: injects compressed context
-
-## Presets
-
-```
-presets/cordis-lite/
-├── agent.cordis.yml     ← Compact agent + NKG + token-efficient persona
-└── preset.yml           ← Display metadata
-```
-
-## Plugins (also available as dynamic plugins)
-
-```
-plugins/
-├── nkg/
-│   └── index.js          ← NKG static Cordis plugin (production)
-├── nkg.js                ← NKG Host variant (dynamic)
-├── nkg-client.js         ← NKG Client visualization (dynamic)
-├── tktrim.js             ← Runtime context suppressor
-├── tokdash.js            ← Token counter Host
-└── tokdash-client.js     ← Token counter Client
-```
-
-## Getting Started
-
-1. Install DeepSeek Harness
-2. Copy `presets/cordis-lite/` to `~/.dsh/.agent-presets/cordis-lite/`
-3. Copy `plugins/nkg/` to `~/.dsh/.agent-presets/cordis-lite/plugins/nkg/`
-4. Start a session on the `cordis-lite` preset
-5. The NKG auto-creates `.nkg.json` in your workspace on first tool event
+The `cordis-lite` preset is itself a token optimization: it mounts only the tools a coding agent actually uses — no dynamic-plugin toolchain, no workflow/ralph machinery — cutting thousands of system-prompt tokens per request versus a full preset.
 
 ## Roadmap
 
-- [x] Static Cordis plugin (permanent, mounts with preset)
-- [x] Cross-session persistence (.nkg.json per workspace)
-- [x] TF-IDF semantic retrieval
-- [x] Self-evolving edge weights
-- [x] Mount-validation passing
-- [ ] Skill auto-ingestion (parse SKILL.md into graph nodes on mount)
-- [ ] Graph decay (unused edges weaken over time)
-- [ ] Visualization panel (real SVG force-directed graph)
-- [ ] Export/import for sharing graphs between machines
+- [x] Static Cordis plugin — mounts with the preset, survives restarts
+- [x] Git-aware cross-session persistence (`.git/nkg.json`)
+- [x] TF-IDF semantic retrieval (zero dependencies)
+- [x] Self-evolution: dedup counts, fix-reuse edge boosting, resolved tracking
+- [x] 30-day decay with stale-node filtering *(v9.1)*
+- [x] Prompt-cache-stable session snapshots *(v9.1)*
+- [ ] Skill auto-ingestion (parse `SKILL.md` files into graph nodes on mount)
+- [ ] Force-directed SVG graph visualization panel
+- [ ] Graph export/import for sharing between machines and teammates
+- [ ] Configurable capture rules (custom node types per project)
+
+## Contributing
+
+Issues and PRs welcome. The whole plugin is one file — [`plugins/nkg/index.js`](plugins/nkg/index.js) — so it's an easy codebase to jump into. Good first contributions: items on the roadmap, capture rules for more tool types, or graph pruning strategies.
 
 ## License
 
-MIT
+[MIT](LICENSE) © Rikin Shah
