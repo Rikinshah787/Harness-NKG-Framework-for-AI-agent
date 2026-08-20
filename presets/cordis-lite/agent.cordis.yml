@@ -1,4 +1,4 @@
-# The `standard` agent preset: the full coding agent, mounted once per process.
+# The `cordis-lite` agent preset: lean coding agent (copied from `standard`), mounted once per process.
 #
 # This file is an AGENT-PLANE composition. The roster mounts it ONCE under a
 # standing scope; every session naming it joins by scope parentage, so the

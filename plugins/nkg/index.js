@@ -3,7 +3,8 @@
 // Mounted by the cordis-lite agent preset. Every session:
 // 1. Finds the git repo root (if any) and loads .git/nkg.json
 // 2. Captures errors, decisions, and file edits from tool results
-// 3. Injects compressed context (3 lines max) before each model step
+// 3. Injects a compressed context snapshot (computed once per session so the
+//    system-prompt prefix stays stable and the request cache keeps hitting)
 // 4. Self-evolves: edge decay on unused connections, fix re-use boosts
 //
 // The graph follows the repo — same graph whether you cd into a subdirectory,
@@ -19,29 +20,25 @@ function apply(ctx) {
   let nextId = 0
   let graphPath = null
   let gitRoot = null
+  let contextSnapshot = null
 
   const uid = () => 'n' + String(++nextId)
 
   // ── find git root ──
   async function findGitRoot() {
     try {
-      // Walk up from cwd looking for .git
-      let current = await ctx.fs.resolve('.')
+      // Walk up from the workspace one level at a time looking for .git
+      let prefix = ''
       for (let i = 0; i < 10; i++) {
         try {
-          const gitDir = await ctx.fs.resolve('.git')
-          // Check if it's a directory
+          const gitDir = await ctx.fs.resolve(prefix + '.git')
           const stat = await ctx.fs.stat(gitDir)
           if (stat) {
-            gitRoot = current
+            gitRoot = prefix
             return
           }
         } catch { /* .git not here, go up */ }
-        try {
-          current = await ctx.fs.resolve('..')
-        } catch {
-          break // Can't go further up
-        }
+        prefix += '../'
       }
     } catch {
       // No git repo — use workspace .nkg.json as fallback
@@ -51,9 +48,9 @@ function apply(ctx) {
   async function load() {
     await findGitRoot()
 
-    if (gitRoot) {
+    if (gitRoot !== null) {
       // Git-aware: store in .git/nkg.json (gitignored by default)
-      graphPath = await ctx.fs.resolve('.git/nkg.json')
+      graphPath = await ctx.fs.resolve(gitRoot + '.git/nkg.json')
     } else {
       // Fallback: store in workspace root
       graphPath = await ctx.fs.resolve('.nkg.json')
@@ -294,6 +291,11 @@ function apply(ctx) {
     name: 'nkg-context',
     order: 450,
     provider() {
+      // Snapshot once per session: a system-prompt section that mutates every
+      // model step invalidates the request cache from that point onward, which
+      // costs far more than the few lines it injects. New events still update
+      // the graph on disk for future sessions.
+      if (contextSnapshot !== null) return contextSnapshot
       const ids = Object.keys(graph.nodes)
       if (!ids.length) return ''
 
@@ -305,8 +307,8 @@ function apply(ctx) {
       const decisions = []
       for (const id of ids) {
         const n = graph.nodes[id]
-        if (n.type === 'error' && !n.resolved) errors.push({ id, ...n })
-        if (n.type === 'decision') decisions.push({ id, ...n })
+        if (n.type === 'error' && !n.resolved && !n.stale) errors.push({ id, ...n })
+        if (n.type === 'decision' && !n.stale) decisions.push({ id, ...n })
       }
       errors.sort((a, b) => (b.count || 1) - (a.count || 1))
       decisions.sort((a, b) => (b.count || 1) - (a.count || 1))
@@ -336,7 +338,8 @@ function apply(ctx) {
         }
       }
 
-      return formatContext(results.slice(0, 5))
+      contextSnapshot = formatContext(results.slice(0, 5))
+      return contextSnapshot
     },
   })
 
