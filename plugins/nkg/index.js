@@ -1,12 +1,15 @@
-// nkg/index.js — Neural Knowledge Graph: permanent Cordis plugin
+// nkg/index.js — Neural Knowledge Graph v9: self-evolving, git-aware
 //
 // Mounted by the cordis-lite agent preset. Every session:
-// 1. Loads .nkg.json from the workspace root
-// 2. Captures errors and decisions from tool results
+// 1. Finds the git repo root (if any) and loads .git/nkg.json
+// 2. Captures errors, decisions, and file edits from tool results
 // 3. Injects compressed context (3 lines max) before each model step
-// 4. Self-evolves: edge weights strengthen on repeated patterns
+// 4. Self-evolves: edge decay on unused connections, fix re-use boosts
 //
-// No seed data — all data comes from real tool events and the .nkg.json file.
+// The graph follows the repo — same graph whether you cd into a subdirectory,
+// clone to a new machine, or switch branches.
+//
+// No seed data. All data comes from real tool events.
 
 const name = 'nkg'
 const inject = ['fs', 'systemPrompt']
@@ -15,38 +18,71 @@ function apply(ctx) {
   let graph = { nodes: {}, edges: [] }
   let nextId = 0
   let graphPath = null
+  let gitRoot = null
 
   const uid = () => 'n' + String(++nextId)
 
-  // ── persistence ──
-  async function load() {
+  // ── find git root ──
+  async function findGitRoot() {
     try {
-      const target = await ctx.fs.resolve('.nkg.json')
-      graphPath = target
-      const text = await ctx.fs.readText(target)
+      // Walk up from cwd looking for .git
+      let current = await ctx.fs.resolve('.')
+      for (let i = 0; i < 10; i++) {
+        try {
+          const gitDir = await ctx.fs.resolve('.git')
+          // Check if it's a directory
+          const stat = await ctx.fs.stat(gitDir)
+          if (stat) {
+            gitRoot = current
+            return
+          }
+        } catch { /* .git not here, go up */ }
+        try {
+          current = await ctx.fs.resolve('..')
+        } catch {
+          break // Can't go further up
+        }
+      }
+    } catch {
+      // No git repo — use workspace .nkg.json as fallback
+    }
+  }
+
+  async function load() {
+    await findGitRoot()
+
+    if (gitRoot) {
+      // Git-aware: store in .git/nkg.json (gitignored by default)
+      graphPath = await ctx.fs.resolve('.git/nkg.json')
+    } else {
+      // Fallback: store in workspace root
+      graphPath = await ctx.fs.resolve('.nkg.json')
+    }
+
+    try {
+      const text = await ctx.fs.readText(graphPath)
       graph = JSON.parse(text)
+      if (!graph.nodes) graph.nodes = {}
+      if (!graph.edges) graph.edges = []
       nextId = Math.max(0, ...Object.keys(graph.nodes).map(k => parseInt(k.slice(1), 10) || 0))
     } catch {
       // No file yet — start fresh
-      try { graphPath = await ctx.fs.resolve('.nkg.json') } catch { /* will try again on save */ }
     }
   }
 
   async function save() {
-    if (!graphPath) {
-      try { graphPath = await ctx.fs.resolve('.nkg.json') } catch { return }
-    }
+    if (!graphPath) return
     try {
       await ctx.fs.writeText(graphPath, JSON.stringify(graph, null, 2))
     } catch {
-      // Write can fail due to sandbox — the in-memory graph still works
+      // Write can fail due to sandbox — in-memory graph still works
     }
   }
 
   // ── graph helpers ──
   function addNode(node) {
     const id = uid()
-    graph.nodes[id] = { ...node, ts: new Date().toISOString() }
+    graph.nodes[id] = { ...node, ts: Date.now(), first: Date.now() }
     return id
   }
 
@@ -54,9 +90,10 @@ function apply(ctx) {
     const existing = graph.edges.find(e => e.from === from && e.to === to && e.label === label)
     if (existing) {
       existing.weight = (existing.weight || 1) + 1
+      existing.last = Date.now()
       return
     }
-    graph.edges.push({ from, to, label, weight: 1 })
+    graph.edges.push({ from, to, label, weight: 1, first: Date.now(), last: Date.now() })
   }
 
   function findOrCreateFileNode(path) {
@@ -64,7 +101,7 @@ function apply(ctx) {
       if (n.type === 'file' && n.path === path) return id
     }
     const id = uid()
-    graph.nodes[id] = { type: 'file', path, ts: new Date().toISOString() }
+    graph.nodes[id] = { type: 'file', path, ts: Date.now(), first: Date.now() }
     return id
   }
 
@@ -75,7 +112,7 @@ function apply(ctx) {
     return null
   }
 
-  // ── tokenization (TF-IDF) ──
+  // ── tokenization ──
   function tokenize(text) {
     return (text || '').toLowerCase()
       .replace(/[^a-z0-9\s]/g, ' ')
@@ -84,13 +121,16 @@ function apply(ctx) {
   }
 
   function semanticSearch(query, limit = 5) {
-    const docs = Object.entries(graph.nodes).map(([id, n]) => ({
-      id,
-      tokens: tokenize((n.text || '') + ' ' + (n.path || '') + ' ' + (n.tool || '')),
-    }))
-    if (!docs.length) return []
+    const entries = Object.entries(graph.nodes)
+    if (!entries.length) return []
 
-    // IDF
+    const docs = entries.map(([id, n]) => ({
+      id,
+      tokens: tokenize(
+        (n.text || '') + ' ' + (n.path || '') + ' ' + (n.tool || '') + ' ' + (n.fix || '')
+      ),
+    }))
+
     const df = {}
     for (const d of docs) {
       const seen = new Set()
@@ -101,7 +141,6 @@ function apply(ctx) {
     const N = docs.length
     const idf = t => Math.log((N + 1) / ((df[t] || 0) + 1)) + 1
 
-    // TF vectors
     const vectors = docs.map(d => {
       const tf = {}
       for (const t of d.tokens) tf[t] = (tf[t] || 0) + 1
@@ -111,7 +150,6 @@ function apply(ctx) {
       return { id: d.id, vec }
     })
 
-    // Query vector
     const qt = tokenize(query)
     const qf = {}
     for (const t of qt) qf[t] = (qf[t] || 0) + 1
@@ -119,7 +157,6 @@ function apply(ctx) {
     const qv = {}
     for (const t of Object.keys(qf)) qv[t] = (qf[t] / qm) * idf(t)
 
-    // Cosine similarity
     return vectors
       .map(v => {
         let dot = 0
@@ -137,36 +174,60 @@ function apply(ctx) {
 
   function formatContext(results) {
     if (!results.length) return ''
-    const lines = ['## Knowledge Graph']
+    const lines = ['## Repo Memory']
     const shown = new Set()
     for (const r of results) {
       const n = r.node
       if (shown.has(r.id)) continue
       shown.add(r.id)
-      const prefix = n.type === 'decision' ? '📋' : n.type === 'error' ? '⚠️' : '📁'
-      lines.push(`- ${prefix} [${r.score}%] ${(n.text || '').slice(0, 80)}`)
-      if (n.fix) lines.push(`  ↳ Fix: ${n.fix}`)
+      const prefix = n.type === 'decision' ? '🔄' : n.type === 'error' ? '❌' : n.type === 'file' ? '📁' : '•'
+      lines.push(`- ${prefix} [${r.score}%] ${(n.text || n.path || '').slice(0, 80)}`)
+      if (n.fix) lines.push(`  ↳ Known fix: ${n.fix}`)
     }
     return lines.join('\n')
   }
 
-  // ── live extraction from tool results ──
+  // ── self-evolution: decay ──
+  function decay() {
+    const now = Date.now()
+    const THIRTY_DAYS = 30 * 24 * 60 * 60 * 1000
+
+    // Decay unused edges
+    for (const e of graph.edges) {
+      const age = now - (e.last || e.first || now)
+      if (age > THIRTY_DAYS) {
+        e.weight = Math.max(1, (e.weight || 1) - 1)
+      }
+    }
+
+    // Mark stale nodes
+    for (const [id, n] of Object.entries(graph.nodes)) {
+      const age = now - (n.ts || n.first || now)
+      if (age > THIRTY_DAYS) {
+        n.stale = true
+      }
+    }
+  }
+
+  // ── live extraction ──
   ctx.on('tools/result', (exec, result) => {
     const name = exec.name
     const args = exec.args || {}
 
-    // Capture shell errors
+    // ── shell errors ──
     if ((name === 'pwsh' || name === 'bash') && result.error) {
       const text = String(result.error).slice(0, 200)
       let fix = null
       const existing = deduplicate(text, 'error')
+
       if (existing) {
-        graph.nodes[existing].count = (graph.nodes[existing].count || 1) + 1
-        graph.nodes[existing].ts = new Date().toISOString()
-        // Self-evolve: if we have a fix and it's been used before, boost it
-        if (graph.nodes[existing].fix) {
+        const node = graph.nodes[existing]
+        node.count = (node.count || 1) + 1
+        node.ts = Date.now()
+        // Self-evolve: if we have a known fix, link it
+        if (node.fix) {
           for (const [id, n] of Object.entries(graph.nodes)) {
-            if (n.type === 'decision' && n.text && n.text.includes(graph.nodes[existing].fix.slice(0, 10))) {
+            if (n.type === 'decision' && n.text && n.text.includes(node.fix.slice(0, 12))) {
               addEdge(existing, id, 'fixed_by')
             }
           }
@@ -175,13 +236,17 @@ function apply(ctx) {
         if (text.includes('EPERM')) fix = 'Use stdio:inherit'
         else if (text.includes('sandbox')) fix = 'Escalate sandbox permissions'
         else if (text.includes('not found') || text.includes('not recognized')) fix = 'Check installation'
-        addNode({ type: 'error', tool: name, text, fix, count: 1 })
+        const nid = addNode({ type: 'error', tool: name, text, fix, count: 1 })
+        // Link to any file mentioned in the command
+        const cmd = args.command || ''
+        const fileMatch = cmd.match(/([A-Z]:[\\/][\w.\\\-]+|~?\/[\w.\/\-]+)/)
+        if (fileMatch) addEdge(nid, findOrCreateFileNode(fileMatch[1]), 'errored_in')
       }
       save()
       return
     }
 
-    // Capture file edits
+    // ── file edits ──
     if (name === 'edit' || name === 'write') {
       const path = args.file_path || ''
       if (!path) return
@@ -190,16 +255,41 @@ function apply(ctx) {
       const existing = deduplicate(text, 'decision')
       if (existing) {
         graph.nodes[existing].count = (graph.nodes[existing].count || 1) + 1
-        graph.nodes[existing].ts = new Date().toISOString()
+        graph.nodes[existing].ts = Date.now()
       } else {
         const nid = addNode({ type: 'decision', text, count: 1 })
         addEdge(nid, findOrCreateFileNode(path), 'affected')
       }
       save()
+      return
+    }
+
+    // ── successful fixes → close the loop ──
+    // If a pwsh command succeeds right after an error, strengthen the fix connection
+    if (name === 'pwsh' && !result.error) {
+      // Find the most recent error
+      let recentError = null
+      let recentTs = 0
+      for (const [id, n] of Object.entries(graph.nodes)) {
+        if (n.type === 'error' && (n.ts || 0) > recentTs) {
+          recentError = id
+          recentTs = n.ts || 0
+        }
+      }
+      if (recentError && recentTs > Date.now() - 60000) {
+        // The command that just succeeded — was it a known fix?
+        const cmd = args.command || ''
+        const fix = graph.nodes[recentError].fix
+        if (fix && cmd.includes(fix.slice(0, 12))) {
+          addEdge(recentError, addNode({ type: 'fix_applied', text: `Applied: ${fix.slice(0,40)}`, count: 1 }), 'resolved_by')
+          graph.nodes[recentError].resolved = true
+          save()
+        }
+      }
     }
   })
 
-  // ── compressed context injection ──
+  // ── context injection ──
   ctx.systemPrompt.context({
     name: 'nkg-context',
     order: 450,
@@ -207,12 +297,15 @@ function apply(ctx) {
       const ids = Object.keys(graph.nodes)
       if (!ids.length) return ''
 
-      // Collect
+      // Decay stale edges
+      decay()
+
+      // Collect and sort
       const errors = []
       const decisions = []
       for (const id of ids) {
         const n = graph.nodes[id]
-        if (n.type === 'error') errors.push({ id, ...n })
+        if (n.type === 'error' && !n.resolved) errors.push({ id, ...n })
         if (n.type === 'decision') decisions.push({ id, ...n })
       }
       errors.sort((a, b) => (b.count || 1) - (a.count || 1))
@@ -221,13 +314,13 @@ function apply(ctx) {
       const results = []
       const shown = new Set()
 
-      // Top errors by count
+      // Top unresolved errors
       for (const e of errors.slice(0, 2)) {
         results.push({ id: e.id, node: e, score: Math.min(100, (e.count || 1) * 30) })
         shown.add(e.id)
       }
 
-      // Top decisions by count
+      // Top recent decisions
       for (const d of decisions.slice(0, 2)) {
         if (!shown.has(d.id)) {
           results.push({ id: d.id, node: d, score: Math.min(100, (d.count || 1) * 25) })
@@ -235,7 +328,7 @@ function apply(ctx) {
         }
       }
 
-      // Semantic search for related nodes
+      // Semantic search for related context
       if (errors.length > 0) {
         const related = semanticSearch(errors[0].text, 2)
         for (const r of related) {
