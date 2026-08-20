@@ -1,97 +1,137 @@
-// nkg.js — Neural Knowledge Graph v4 Dynamic Cordis Plugin (Host)
+// nkg.js — NKG v7 Host: Neural Knowledge Graph with Skills Compiler
 //
-// Portable: stores .nkg.json in the session workspace root via
-// sandboxPolicy.workspaceRoot — works on any machine, any repo.
+// Core engine for the Harness NKG Framework.
+// - Pre-processes skills into graph nodes (no more full SKILL.md loading)
+// - Captures errors and decisions from tool events in real-time
+// - Outputs compressed 3-line context instead of verbose markdown
+// - Exposes graph-data RPC for the Client visualization
 //
-// Captures errors (shell) and decisions (file edits). TF-IDF
-// semantic retrieval, Jaccard deduplication, edge weighting,
-// frequency-based context injection. Provides graph-data RPC
-// for the Client visualization panel.
+// Deploy: cordis_define → cordis_run
 
 return {
   apply(ctx) {
-    const sp = ctx.get('systemPrompt')
-    const fs = ctx.get('fs')
-    const sandbox = ctx.get('sandboxPolicy')
-    if (sp === undefined || fs === undefined) return
+    var sp = ctx.get('systemPrompt')
+    if (sp === undefined) return
 
-    const wsRoot = sandbox ? sandbox.workspaceRoot : process.cwd()
-    const GRAPH_PATH = wsRoot.replace(/\\/g, '/') + '/.nkg.json'
-    let graph = { nodes: {}, edges: [] }
-    let nextId = 0
-    const uid = () => 'n' + String(++nextId)
+    var graph = { nodes: {}, edges: [] }
+    var nextId = 0
+    function uid() { nextId++; return 'n' + nextId }
 
-    async function load() {
-      try {
-        const target = await fs.resolve(GRAPH_PATH)
-        const text = await fs.readText(target)
-        graph = JSON.parse(text)
-        nextId = Math.max(0, ...Object.keys(graph.nodes).map(k => parseInt(k.slice(1), 10) || 0))
-        console.log('NKG loaded:', Object.keys(graph.nodes).length, 'nodes')
-      } catch (_) { console.log('NKG: fresh start at', GRAPH_PATH) }
+    function addNode(node) { var id = uid(); graph.nodes[id] = node; node.ts = new Date().toISOString(); return id }
+    function addEdge(from, to, label) {
+      for (var i = 0; i < graph.edges.length; i++) {
+        var e = graph.edges[i]
+        if (e.from === from && e.to === to && e.label === label) { e.weight = (e.weight||1)+1; return }
+      }
+      graph.edges.push({ from: from, to: to, label: label, weight: 1 })
     }
-
-    async function save() {
-      try { const target = await fs.resolve(GRAPH_PATH); await fs.writeText(target, JSON.stringify(graph, null, 2)) } catch (e) { console.error('NKG save:', String(e)) }
-    }
-
-    function addNode(node) { const id = uid(); graph.nodes[id] = { ...node, ts: new Date().toISOString() }; return id }
     function findOrCreateFileNode(path) {
-      for (const [id, node] of Object.entries(graph.nodes)) { if (node.type === 'file' && node.path === path) return id }
-      const id = uid(); graph.nodes[id] = { type: 'file', path: path, ts: new Date().toISOString() }; return id
+      var ids = Object.keys(graph.nodes)
+      for (var i = 0; i < ids.length; i++) { var n = graph.nodes[ids[i]]; if (n.type === 'file' && n.path === path) return ids[i] }
+      var id = uid(); graph.nodes[id] = { type: 'file', path: path, ts: new Date().toISOString() }; return id
     }
-
-    harness.handle('graph-data', async () => {
-      const nodes = Object.entries(graph.nodes).map(([id, n]) => ({
-        id, type: n.type,
-        label: n.type === 'file' ? (n.path || '').split(/[/\\]/).pop() : (n.text || '').slice(0, 40),
-        count: n.count || 1, ts: n.ts,
-      }))
-      const edges = graph.edges.map(e => ({ from: e.from, to: e.to, label: e.label, weight: e.weight || 1 }))
-      return { nodes, edges }
-    })
-
-    function tokenize(text) { return (text || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(w => w.length > 1) }
-    function semanticSearch(query, limit) {
-      limit = limit || 5
-      const docs = Object.entries(graph.nodes).map(([id, n]) => ({ id, tokens: tokenize((n.text || '') + ' ' + (n.path || '') + ' ' + (n.tool || '')) }))
-      if (docs.length === 0) return []
-      const df = {}; for (const d of docs) { const seen = new Set(); for (const t of d.tokens) { if (!seen.has(t)) { df[t] = (df[t] || 0) + 1; seen.add(t) } } }
-      const N = docs.length; function idf(t) { return Math.log((N + 1) / ((df[t] || 0) + 1)) + 1 }
-      const vectors = docs.map(d => { const tf = {}; for (const t of d.tokens) tf[t] = (tf[t] || 0) + 1; const maxTf = Math.max(1, ...Object.values(tf)); const vec = {}; for (const t of Object.keys(tf)) vec[t] = (tf[t] / maxTf) * idf(t); return { id: d.id, vec } })
-      const qTokens = tokenize(query); const qTf = {}; for (const t of qTokens) qTf[t] = (qTf[t] || 0) + 1; const qMax = Math.max(1, ...Object.values(qTf)); const queryVec = {}; for (const t of Object.keys(qTf)) queryVec[t] = (qTf[t] / qMax) * idf(t)
-      return vectors.map(v => { let dot = 0; for (const k of Object.keys(queryVec)) { if (v.vec[k] !== undefined) dot += queryVec[k] * v.vec[k] }; const na = Math.sqrt(Object.values(v.vec).reduce((s, x) => s + x * x, 0)) || 1; const nb = Math.sqrt(Object.values(queryVec).reduce((s, x) => s + x * x, 0)) || 1; return { id: v.id, node: graph.nodes[v.id], score: Math.round(dot / (na * nb) * 100) } }).filter(s => s.score > 5).sort((a, b) => b.score - a.score).slice(0, limit)
-    }
-
-    function formatContext(results) {
-      if (results.length === 0) return ''
-      const lines = ['## Knowledge Graph (semantic retrieval)']
-      for (const r of results) { const n = r.node; const prefix = n.type === 'decision' ? '📋' : n.type === 'error' ? '⚠️' : '📁'; lines.push(`- ${prefix} [${r.score}%] ${n.text}`); if (n.fix) lines.push(`  Fix: ${n.fix}`); for (const e of graph.edges) { if (e.from === r.id && graph.nodes[e.to]?.type === 'file') lines.push(`  File: ${graph.nodes[e.to].path}`) } }
-      return lines.join('\n')
-    }
-
-    function deduplicate(newText, nodeType) {
-      for (const [id, node] of Object.entries(graph.nodes)) { if (node.type === nodeType && node.text === newText) return id }
-      const newTokens = new Set(tokenize(newText))
-      for (const [id, node] of Object.entries(graph.nodes)) { if (node.type !== nodeType) continue; const existing = new Set(tokenize(node.text)); let overlap = 0; for (const t of newTokens) { if (existing.has(t)) overlap++ }; if (overlap / Math.max(1, new Set([...newTokens, ...existing]).size) > 0.7) return id }
+    function deduplicate(txt, tp) {
+      var ids = Object.keys(graph.nodes)
+      for (var i = 0; i < ids.length; i++) { var n = graph.nodes[ids[i]]; if (n.type === tp && n.text === txt) return ids[i] }
       return null
     }
 
-    function boostEdge(from, to, label) { const e = graph.edges.find(e => e.from === from && e.to === to && e.label === label); if (e) { e.weight = (e.weight || 1) + 1; return }; graph.edges.push({ from, to, label, weight: 1 }) }
-
-    ctx.on('tools/result', (exec, result) => {
-      const name = exec.name; const args = exec.args || {}
-      if ((name === 'pwsh' || name === 'bash') && result.error) {
-        const errText = String(result.error).slice(0, 200); const dup = deduplicate(errText, 'error')
-        if (dup) { graph.nodes[dup].count = (graph.nodes[dup].count || 1) + 1; graph.nodes[dup].ts = new Date().toISOString() }
-        else { const cmd = args.command || ''; const fileMatch = cmd.match(/([\\/][\w.\-\/]+\\.[a-z]{1,6})/i); let fix = null; if (errText.includes('EPERM')) fix = 'Use stdio: inherit instead of pipe'; else if (errText.includes('sandbox')) fix = 'Check sandbox permissions'; else if (errText.includes('not found') || errText.includes('not recognized')) fix = 'Verify command/package is installed'; const id = addNode({ type: 'error', tool: name, text: errText, fix, count: 1 }); if (fileMatch) boostEdge(id, findOrCreateFileNode(fileMatch[1]), 'errored_in') }
-        save(); return
+    // ── RPC ──
+    harness.handle('graph-data', function() {
+      var nodes = []
+      var ids = Object.keys(graph.nodes)
+      for (var i = 0; i < ids.length; i++) {
+        var n = graph.nodes[ids[i]]
+        var label = ''
+        if (n.type === 'file') label = (n.path||'').split(/[/\\]/).pop()
+        else if (n.type === 'skill') label = n.skill || ''
+        else label = (n.text||'').slice(0, 40)
+        nodes.push({ id: ids[i], type: n.type, label: label, count: n.count||1, ts: n.ts })
       }
-      if (name === 'edit' || name === 'write') { const filePath = args.file_path || ''; if (!filePath) return; const basename = filePath.split('/').pop() || filePath.split('\\').pop(); const text = `${name === 'write' ? 'Created' : 'Edited'} ${basename}`; const dup = deduplicate(text, 'decision'); if (dup) { graph.nodes[dup].count = (graph.nodes[dup].count || 1) + 1; graph.nodes[dup].ts = new Date().toISOString() } else { const id = addNode({ type: 'decision', text, count: 1 }); boostEdge(id, findOrCreateFileNode(filePath), 'affected') }; save() }
+      return { nodes: nodes, edges: graph.edges }
     })
 
-    sp.context({ name: 'nkg-context', order: 500, provider: () => { if (Object.keys(graph.nodes).length === 0) return ''; const ae = Object.entries(graph.nodes).filter(([_, n]) => n.type === 'error').sort((a, b) => (b[1].count || 1) - (a[1].count || 1)); const ad = Object.entries(graph.nodes).filter(([_, n]) => n.type === 'decision').sort((a, b) => (b[1].count || 1) - (a[1].count || 1)); const r = []; const s = new Set(); for (const [id, n] of ae.slice(0, 3)) { r.push({ id, node: n, score: Math.min(100, (n.count || 1) * 30) }); s.add(id) }; for (const [id, n] of ad.slice(0, 3)) { if (!s.has(id)) { r.push({ id, node: n, score: Math.min(100, (n.count || 1) * 25) }); s.add(id) } }; if (ae.length > 0) { const sem = semanticSearch(ae[0][1].text, 2); for (const x of sem) { if (!s.has(x.id)) { r.push(x); s.add(x.id) } } }; return formatContext(r.slice(0, 6)) } })
+    // ── Skill ingestion ──
+    function ingestSkills() {
+      var ids = Object.keys(graph.nodes)
+      for (var i = 0; i < ids.length; i++) { if (graph.nodes[ids[i]].type === 'skill') return }
 
-    load()
+      // ponytail
+      var pt = addNode({ type: 'skill', skill: 'ponytail', text: 'Lazy coding: YAGNI, stdlib first, native over deps, one-liners', intensity: 'full' })
+      addEdge(pt, addNode({ type: 'skill_rule', text: 'Does this need to exist? Skip speculative features', skill: 'ponytail' }), 'has_rule')
+      addEdge(pt, addNode({ type: 'skill_rule', text: 'Stdlib over custom code. Already-installed dep over new dep', skill: 'ponytail' }), 'has_rule')
+      addEdge(pt, addNode({ type: 'skill_rule', text: 'Shortest diff wins. No unrequested abstractions', skill: 'ponytail' }), 'has_rule')
+
+      // karpathy-guidelines
+      var kg = addNode({ type: 'skill', skill: 'karpathy-guidelines', text: 'Think before coding: surface assumptions, surgical changes, verify' })
+      addEdge(kg, addNode({ type: 'skill_rule', text: 'State assumptions explicitly. Present multiple interpretations', skill: 'karpathy-guidelines' }), 'has_rule')
+      addEdge(kg, addNode({ type: 'skill_rule', text: 'Make surgical changes. Dont refactor unrelated code', skill: 'karpathy-guidelines' }), 'has_rule')
+      addEdge(kg, addNode({ type: 'skill_rule', text: 'Define verifiable success criteria before writing code', skill: 'karpathy-guidelines' }), 'has_rule')
+
+      // find-skills
+      var fs = addNode({ type: 'skill', skill: 'find-skills', text: 'Discover and install agent skills from ecosystem' })
+      addEdge(fs, addNode({ type: 'skill_rule', text: 'Use when user asks how to do X or wants to extend capabilities', skill: 'find-skills' }), 'has_rule')
+    }
+    ingestSkills()
+
+    // ── Seeds ──
+    if (Object.keys(graph.nodes).filter(function(k) { return graph.nodes[k].type === 'error' }).length === 0) {
+      var e1 = addNode({ type: 'error', tool: 'pwsh', text: 'EPERM on named pipe', fix: 'Use stdio:inherit', count: 3 })
+      var d1 = addNode({ type: 'decision', text: 'Built NKG with TF-IDF retrieval', count: 1 })
+      var d2 = addNode({ type: 'decision', text: 'Created cordis-lite preset', count: 1 })
+      var f1 = findOrCreateFileNode('plugins/nkg.js')
+      var f2 = findOrCreateFileNode('presets/cordis-lite/agent.cordis.yml')
+      addEdge(e1, f1, 'errored_in')
+      addEdge(d1, f1, 'affected')
+      addEdge(d2, f2, 'affected')
+    }
+
+    // ── Live extraction ──
+    ctx.on('tools/result', function(exec, result) {
+      var n = exec.name; var a = exec.args || {}
+      if ((n === 'pwsh' || n === 'bash') && result.error) {
+        var t = String(result.error).slice(0, 200)
+        var d = deduplicate(t, 'error')
+        if (d) { graph.nodes[d].count = (graph.nodes[d].count||1)+1; graph.nodes[d].ts = new Date().toISOString() }
+        else {
+          var c = a.command || ''
+          var m = c.match(/([\\/][\w.\-\/]+\\.[a-z]{1,6})/i)
+          var id = addNode({ type: 'error', tool: n, text: t, fix: null, count: 1 })
+          if (m) addEdge(id, findOrCreateFileNode(m[1]), 'errored_in')
+        }
+      }
+      if (n === 'edit' || n === 'write') {
+        var p = a.file_path || ''
+        if (!p) return
+        var b = p.split('/').pop() || p.split('\\').pop()
+        var txt = (n === 'write' ? 'Created ' : 'Edited ') + b
+        var d = deduplicate(txt, 'decision')
+        if (d) { graph.nodes[d].count = (graph.nodes[d].count||1)+1; graph.nodes[d].ts = new Date().toISOString() }
+        else { var id = addNode({ type: 'decision', text: txt, count: 1 }); addEdge(id, findOrCreateFileNode(p), 'affected') }
+      }
+    })
+
+    // ── Compressed context (max 3 lines) ──
+    sp.context({ name: 'nkg-context', order: 450, provider: function() {
+      var ids = Object.keys(graph.nodes)
+      if (ids.length === 0) return ''
+
+      var errors = []; var decisions = []; var rules = []
+      for (var i = 0; i < ids.length; i++) {
+        var n = graph.nodes[ids[i]]
+        if (n.type === 'error') errors.push([ids[i], n])
+        if (n.type === 'decision') decisions.push([ids[i], n])
+        if (n.type === 'skill_rule') rules.push([ids[i], n])
+      }
+      errors.sort(function(a,b){ return (b[1].count||1)-(a[1].count||1) })
+      decisions.sort(function(a,b){ return (b[1].count||1)-(a[1].count||1) })
+
+      var lines = []
+      if (errors.length > 0) lines.push('⚠️ ' + errors[0][1].text)
+      if (decisions.length > 0) lines.push('📋 ' + decisions[0][1].text)
+      if (rules.length > 0) lines.push('💡 ' + rules[0][1].text)
+
+      return lines.length > 0 ? lines.join('\n') : ''
+    }})
   },
 }

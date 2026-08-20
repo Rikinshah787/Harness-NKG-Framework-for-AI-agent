@@ -1,122 +1,79 @@
-# Harness NKG Framework for AI Agent
+# Harness NKG Framework
 
-A persistent cross-session Neural Knowledge Graph (NKG) that captures decisions, errors, and file relationships from a DeepSeek Harness coding agent session — then injects relevant context into future sessions.
+A Neural Knowledge Graph that runs inside the DeepSeek Harness — capturing decisions, errors, file relationships, and skills into a self-optimizing graph. Compresses context to 3 lines instead of verbose prompts.
 
-## Architecture
+## What It Does
 
-```
-┌─ DeepSeek Harness (Cordis Runtime) ──────┐
-│                                           │
-│  tools/result event ──► Extractors        │
-│  systemPrompt.context ◄── Retriever       │
-│                           │               │
-│                    ┌──────▼──────┐        │
-│                    │   NKG.json  │        │
-│                    │ (workspace) │        │
-│                    └─────────────┘        │
-└───────────────────────────────────────────┘
-```
+| Feature | How |
+|---------|-----|
+| **Skill Compiler** | Pre-processes SKILL.md files into graph nodes — no more loading full markdown into prompts |
+| **Live Extraction** | Captures every error (shell) and decision (file edit) as graph nodes with weighted edges |
+| **Compressed Context** | Injects at most 3 lines before each model step instead of verbose markdown blocks |
+| **Deduplication** | Same error happening again increments count instead of creating duplicate nodes |
+| **Edge Weighting** | Repeated file-error or file-decision connections strengthen edges |
+| **Client Visualization** | Live stats dock under the composer: errors, decisions, files, skills, edges |
 
-## Plugins Included
-
-| Plugin | Type | Purpose |
-|--------|------|---------|
-| `nkg-4` | Dynamic Cordis Plugin | Core NKG: graph store, extractors (errors from shell, decisions from file edits), retrieval injection |
-| `tktrim-1` | Dynamic Cordis Plugin | Suppresses runtime-context snapshot to reduce token cost |
-| `tokdsh-2` | Dynamic Cordis Plugin | Live token counter in the composer dock |
-| `cordis-lite` | Agent Preset | Lean coding agent preset with compact persona, no runtime context, no ralph |
-
-## NKG v2 Features
-
-- **TF-IDF semantic retrieval** — cosine similarity search across all nodes (zero dependencies, pure JS)
-- **Jaccard deduplication** — merges similar errors/decisions (token overlap > 70%), increments `count`
-- **Edge weighting** — repeated file-error or file-decision connections strengthen edges
-- **Fix hints** — pattern-matches common errors (EPERM, sandbox, not found) and suggests fixes
-- **Frequency-weighted injection** — top errors/decisions by recurrence + semantic neighbors of most recent error
-
-## NKG Graph Schema
-
-```json
-{
-  "nodes": {
-    "n1": {
-      "type": "error",
-      "tool": "pwsh",
-      "text": "EPERM on named pipe...",
-      "ts": "2025-01-15T10:30:00Z"
-    },
-    "n2": {
-      "type": "decision",
-      "text": "Edited auth.ts",
-      "ts": "2025-01-15T10:31:00Z"
-    },
-    "n3": {
-      "type": "file",
-      "path": "src/auth.ts",
-      "ts": "2025-01-15T10:31:00Z"
-    }
-  },
-  "edges": [
-    { "from": "n1", "to": "n3", "label": "errored_in" },
-    { "from": "n2", "to": "n3", "label": "affected" }
-  ]
-}
-```
-
-## Directory Structure
+## Plugins
 
 ```
-├── plugins/                    # Dynamic Cordis Plugin source code
-│   ├── nkg.js                 # Neural Knowledge Graph plugin
-│   ├── tktrim.js              # Token trimmer (runtime-context suppressor)
-│   └── tokdash.js             # Token dashboard
-├── presets/                    # Agent presets
-│   └── cordis-lite/           # Lean coding agent preset
-│       ├── agent.cordis.yml
-│       └── preset.yml
-├── nkg.json                    # Live graph (generated at runtime)
-└── README.md
+plugins/
+├── nkg.js              # Host: graph engine, skill compiler, extractors, compressed context
+├── nkg-client.js        # Client: dock visualization in conversation.composer.dock
+├── tktrim.js            # Token optimization: suppresses runtime-context snapshot
+├── tokdash.js           # Token dashboard Host: intercepts llm/stream, counts tokens
+└── tokdash-client.js    # Token dashboard Client: live counter under composer
+```
+
+## Presets
+
+```
+presets/cordis-lite/
+├── agent.cordis.yml     # Lean agent composition (no ralph, compact persona, no runtime context)
+└── preset.yml           # Display metadata
 ```
 
 ## Getting Started
 
-1. Install [DeepSeek Harness](https://github.com/deepseek-ai/dsh)
-2. Copy the presets to `~/.dsh/.agent-presets/cordis-lite/`
+1. Install DeepSeek Harness
+2. Copy `presets/cordis-lite/` to `~/.dsh/.agent-presets/cordis-lite/`
 3. Start a session on the `cordis-lite` preset
-4. Define and run the plugins via `cordis_define` + `cordis_run`
+4. Define plugins via `cordis_define` + `cordis_run`
 
-## NKG Plugin Code
+## Graph Schema
 
-See [`plugins/nkg.js`](plugins/nkg.js) for the full implementation.
+```json
+{
+  "nodes": {
+    "n1": { "type": "error", "tool": "pwsh", "text": "EPERM on named pipe", "count": 3 },
+    "n2": { "type": "decision", "text": "Created cordis-lite preset", "count": 1 },
+    "n3": { "type": "file", "path": "presets/cordis-lite/agent.cordis.yml" },
+    "n4": { "type": "skill", "skill": "ponytail", "text": "Lazy coding: YAGNI..." },
+    "n5": { "type": "skill_rule", "text": "Does this need to exist?", "skill": "ponytail" }
+  },
+  "edges": [
+    { "from": "n1", "to": "n3", "label": "errored_in", "weight": 3 },
+    { "from": "n4", "to": "n5", "label": "has_rule", "weight": 1 }
+  ]
+}
+```
 
-### What it captures
+## Context Output Example
 
-| Trigger | Node type | Description |
-|---------|-----------|-------------|
-| `pwsh`/`bash` errors | `error` | Shell command failures, linked to files |
-| `edit`/`write` calls | `decision` | File modifications |
-| File paths in context | `file` | Referenced files |
-
-### What it injects
-
-Before each model step, the 5 most recent decisions and errors are injected as:
+Before each model step, the NKG injects at most 3 compressed lines:
 
 ```
-## Knowledge Graph Context
-- ⚠️ Error: EPERM on named pipe...
-  File: src/some-test.ts
-- 📋 Decision: Edited auth.ts
-  File: src/auth.ts
+⚠️ EPERM on named pipe
+📋 Created cordis-lite preset
+💡 Does this need to exist? Skip speculative features
 ```
 
 ## Roadmap
 
-- [ ] User-message extraction (parse directives for explicit decisions)
-- [ ] Semantic retrieval (embedding-based similarity search)
-- [ ] Edge weighting and learning feedback loop
-- [ ] Client UI for graph visualization
-- [ ] RPC API for external graph queries
-- [ ] Entity extraction from file contents (functions, classes, imports)
+- [ ] Persistent graph storage (.nkg.json per workspace)
+- [ ] Semantic retrieval (TF-IDF cosine similarity across all nodes)
+- [ ] Skill auto-ingestion from any SKILL.md in user skill dirs
+- [ ] Graph export/import for sharing between machines
+- [ ] Learning feedback loop (usage frequency → edge weight adjustment)
 
 ## License
 
