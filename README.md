@@ -1,4 +1,4 @@
-# 🧠 NKG — Neural Knowledge Graph for AI Agents
+﻿# 🧠 NKG — Neural Knowledge Graph for AI Agents
 
 **Give your AI agent a memory that survives restarts, learns from mistakes, and costs almost nothing in tokens.**
 
@@ -128,9 +128,10 @@ That's it. The graph auto-creates on the first tool event and grows as the agent
 ## What's in the box
 
 ```
-presets/cordis-lite/        Lean agent preset (standard tools, compact persona, NKG mounted)
-├── agent.cordis.yml
-└── preset.yml
+presets/cordis-lite/        Lean coding preset (standard tools, compact persona, NKG mounted)
+presets/sec-agent/          Defensive security-auditor preset: severity-rated findings with
+                            file:line evidence, CVE verification via web search, read-only
+                            bias, secret-safe reporting - same lean toolchain + NKG memory
 plugins/nkg/index.js        ⭐ The NKG plugin (static — mounts with the preset, survives restarts)
 plugins/nkg.js              NKG dynamic-plugin variant (try it via cordis_define without installing)
 plugins/nkg-client.js       Live graph-stats dock for the DSH web UI (dynamic)
